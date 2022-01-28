@@ -166,6 +166,9 @@ def sync(workerid, srcdev, dsthost, dstdev, options):
     addhash = options.addhash
     dryrun = options.dryrun
     interval = options.interval
+    splitparts = options.splitparts
+    # parts start from zero so subtract 1 from option
+    startpart = options.startpart - 1
 
     if not dstdev:
         dstdev = srcdev
@@ -190,11 +193,14 @@ def sync(workerid, srcdev, dsthost, dstdev, options):
         print("[worker %d] Error accessing source device! %s" % (workerid, e), file = options.outfile)
         sys.exit(1)
 
+    # Split block into parts
+    size = ceil(size / splitparts)
+
     chunksize = int(size / options.workers)
-    startpos = workerid * chunksize
+    startpos = workerid * chunksize + (size * startpart)
     if workerid == (options.workers - 1):
         chunksize += size - (chunksize * options.workers)
-    print("[worker %d] Chunk size is %0.1f MB, offset is %d" % (workerid, chunksize / (1024.0 * 1024), startpos), file = options.outfile)
+    print("[worker %d] Chunk size is %0.1f MB, offset is %0.1f MB" % (workerid, chunksize / (1024.0 * 1024), startpos / (1024.0 * 1024)), file = options.outfile)
 
     pause_ms = 0
     if options.pause:
@@ -351,6 +357,8 @@ if __name__ == "__main__":
     parser.add_option("-w", "--workers", dest = "workers", type = "int", help = "number of workers to fork (defaults to 1)", default = 1)
     parser.add_option("-l", "--splay", dest = "splay", type = "int", help = "sleep between creating workers (ms, defaults to 0)", default = 250)
     parser.add_option("-b", "--blocksize", dest = "blocksize", type = "int", help = "block size (bytes, defaults to 1MB)", default = 1024 * 1024)
+    parser.add_option("--splitparts", dest = "splitparts", type = "int", help = "split block into parts (defaults to 1 part)", default = 1)
+    parser.add_option("--startpart", dest = "startpart", type = "int", help = "which part to start from (defaults to part 1)", default = 1)
     parser.add_option("-1", "--hash", dest = "hash", help = "hash used for block comparison (defaults to \"sha512\")", default = "sha512")
     parser.add_option("-2", "--additionalhash", dest = "addhash", help = "second hash used for extra comparison (default is none)")
     parser.add_option("-d", "--fadvise", dest = "fadvise", type = "int", help = "lower cache pressure by using posix_fadivse (requires Python 3 or python-fadvise; 0 = off, 1 = local on, 2 = remote on, 3 = both on; defaults to 3)", default = 3)
