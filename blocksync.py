@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 """
 Synchronise block devices over the network
 
@@ -80,6 +80,17 @@ def getblocks(f, blocksize):
         yield block
 
 
+def readexactly(f, n):
+    """Read exactly n bytes from a file-like object."""
+    data = bytearray()
+    while len(data) < n:
+        chunk = f.read(n - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    return bytes(data)
+
+
 def server(dev, deleteonexit, options):
     global USE_NOREUSE, USE_DONTNEED
 
@@ -123,21 +134,74 @@ def server(dev, deleteonexit, options):
         stdin = sys.stdin
         stdout = sys.stdout
 
-    for i, block in enumerate(getblocks(f, blocksize)):
-        stdout.write(hash1(block).digest())
-        if hash2:
-            stdout.write(hash2(block).digest())
-        stdout.flush()
-        res = stdin.read(COMPLEN)
-        if res == DIFF:
-            newblock = stdin.read(blocksize)
-            newblocklen = len(newblock)
-            f.seek(-newblocklen, 1)
-            f.write(newblock)
-            if USE_DONTNEED:
-                fadvise(f, f.tell() - newblocklen, newblocklen, POSIX_FADV_DONTNEED)
-        if i == maxblock:
-            break
+    batch_size = getattr(options, 'batch', 0)
+
+    if batch_size > 1:
+        # Batched/pipelined mode: send hashes in batches to reduce round-trips
+        total_blocks = maxblock + 1
+        blocks_processed = 0
+
+        while blocks_processed < total_blocks:
+            this_batch = min(batch_size, total_blocks - blocks_processed)
+
+            # Read blocks and compute hashes for the whole batch
+            batch_hashes = bytearray()
+            batch_block_lens = []
+            batch_start_pos = f.tell()
+
+            for j in range(this_batch):
+                block = f.read(blocksize)
+                if not block:
+                    this_batch = j
+                    break
+                batch_block_lens.append(len(block))
+                batch_hashes.extend(hash1(block).digest())
+                if hash2:
+                    batch_hashes.extend(hash2(block).digest())
+
+            if not batch_block_lens:
+                break
+            this_batch = len(batch_block_lens)
+
+            # Send all hashes at once (single flush per batch)
+            stdout.write(bytes(batch_hashes))
+            stdout.flush()
+
+            # Read all responses at once
+            responses = readexactly(stdin, COMPLEN * this_batch)
+
+            # Process diffs - apply replacement blocks
+            write_pos = batch_start_pos
+            for j in range(this_batch):
+                if responses[j*COMPLEN:(j+1)*COMPLEN] == DIFF:
+                    newblock = readexactly(stdin, batch_block_lens[j])
+                    if newblock:
+                        f.seek(write_pos)
+                        f.write(newblock)
+                        if USE_DONTNEED:
+                            fadvise(f, write_pos, len(newblock), POSIX_FADV_DONTNEED)
+                write_pos += batch_block_lens[j]
+
+            # Seek to end of batch for next iteration
+            f.seek(write_pos)
+            blocks_processed += this_batch
+    else:
+        # Original per-block mode
+        for i, block in enumerate(getblocks(f, blocksize)):
+            stdout.write(hash1(block).digest())
+            if hash2:
+                stdout.write(hash2(block).digest())
+            stdout.flush()
+            res = stdin.read(COMPLEN)
+            if res == DIFF:
+                newblock = stdin.read(blocksize)
+                newblocklen = len(newblock)
+                f.seek(-newblocklen, 1)
+                f.write(newblock)
+                if USE_DONTNEED:
+                    fadvise(f, f.tell() - newblocklen, newblocklen, POSIX_FADV_DONTNEED)
+            if i == maxblock:
+                break
 
     if deleteonexit:
         os.remove(__file__)
@@ -163,7 +227,6 @@ def sync(workerid, srcdev, dsthost, dstdev, options):
     global USE_NOREUSE, USE_DONTNEED
 
     blocksize = options.blocksize
-    addhash = options.addhash
     dryrun = options.dryrun
     interval = options.interval
     splitparts = options.splitparts
@@ -246,6 +309,8 @@ def sync(workerid, srcdev, dsthost, dstdev, options):
     cmd += [options.interpreter, remotescript, servercmd, dstdev, '-b', str(blocksize)]
 
     cmd += ['-d', str(options.fadvise), '-1', options.hash]
+    if getattr(options, 'batch', 0) > 1:
+        cmd += ['-B', str(options.batch)]
     if options.addhash:
         cmd += ['-2', options.addhash]
 
@@ -302,47 +367,124 @@ def sync(workerid, srcdev, dsthost, dstdev, options):
     p_in.write(bytes(("%d\n%d\n" % (startpos, size_blocks)).encode("UTF-8")))
     p_in.flush()
     print("[worker %d] Start syncing %d blocks..." % (workerid, size_blocks), file = options.outfile)
-    for l_block in getblocks(f, blocksize):
-        l1_sum = hash1(l_block).digest()
-        r1_sum = p_out.read(hash1len)
-        if hash2:
-            l2_sum = hash2(l_block).digest()
-            r2_sum = p_out.read(hash2len)
-            r2_match = (l2_sum == r2_sum)
-        else:
-            r2_match = True
-        if (l1_sum == r1_sum) and r2_match:
-            same_blocks += 1
-            p_in.write(SAME)
+    batch_size = getattr(options, 'batch', 0)
+
+    if batch_size > 1:
+        # Batched/pipelined mode: process multiple blocks per round-trip
+        hash_size = hash1len + (hash2len if hash2 else 0)
+        blocks_processed = 0
+        print("[worker %d] Batch size: %d blocks per round-trip" % (workerid, batch_size), file = options.outfile)
+
+        while blocks_processed < size_blocks:
+            this_batch = min(batch_size, size_blocks - blocks_processed)
+
+            # Read local blocks for this batch
+            local_blocks = []
+            for j in range(this_batch):
+                block = f.read(blocksize)
+                if not block:
+                    break
+                if USE_DONTNEED:
+                    fadvise(f, f.tell() - len(block), len(block), POSIX_FADV_DONTNEED)
+                local_blocks.append(block)
+
+            if not local_blocks:
+                break
+            this_batch = len(local_blocks)
+
+            # Read all remote hashes at once
+            all_hashes = readexactly(p_out, hash_size * this_batch)
+            if len(all_hashes) < hash_size * this_batch:
+                break
+
+            # Compare and build responses + diff data
+            response = bytearray()
+            diff_data = bytearray()
+
+            for j in range(this_batch):
+                offset = j * hash_size
+                r1_sum = all_hashes[offset:offset + hash1len]
+                l1_sum = hash1(local_blocks[j]).digest()
+
+                r2_match = True
+                if hash2:
+                    r2_sum = all_hashes[offset + hash1len:offset + hash_size]
+                    l2_sum = hash2(local_blocks[j]).digest()
+                    r2_match = (l2_sum == r2_sum)
+
+                if (l1_sum == r1_sum) and r2_match:
+                    same_blocks += 1
+                    response.extend(SAME)
+                else:
+                    diff_blocks += 1
+                    if dryrun:
+                        response.extend(SAME)
+                    else:
+                        response.extend(DIFF)
+                        diff_data.extend(local_blocks[j])
+
+            # Send all responses and diff data with a single flush per batch
+            p_in.write(bytes(response))
+            if diff_data:
+                p_in.write(bytes(diff_data))
             p_in.flush()
-        else:
-            diff_blocks += 1
-            if dryrun:
+
+            if pause_ms:
+                time.sleep(pause_ms * this_batch)
+
+            blocks_processed += this_batch
+
+            # Progress reporting
+            if interactive:
+                t1 = float(time.time())
+                if (t1 - t_last) >= interval:
+                    done_blocks = same_blocks + diff_blocks
+                    delta_blocks = done_blocks - last_blocks
+                    rate = delta_blocks * blocksize / (1024 * 1024 * (t1 - t_last))
+                    print("[worker %d] same: %d, diff: %d, %d/%d, %5.1f MB/s (%s remaining)" % (workerid, same_blocks, diff_blocks, done_blocks, size_blocks, rate, timedelta(seconds = ceil((size_blocks - done_blocks) * (t1 - t0) / done_blocks))), file = options.outfile)
+                    last_blocks = done_blocks
+                    t_last = t1
+    else:
+        # Original per-block mode (with combined writes to reduce flushes)
+        for l_block in getblocks(f, blocksize):
+            l1_sum = hash1(l_block).digest()
+            r1_sum = p_out.read(hash1len)
+            if hash2:
+                l2_sum = hash2(l_block).digest()
+                r2_sum = p_out.read(hash2len)
+                r2_match = (l2_sum == r2_sum)
+            else:
+                r2_match = True
+            if (l1_sum == r1_sum) and r2_match:
+                same_blocks += 1
                 p_in.write(SAME)
                 p_in.flush()
             else:
-                p_in.write(DIFF)
-                p_in.flush()
-                p_in.write(l_block)
-                p_in.flush()
+                diff_blocks += 1
+                if dryrun:
+                    p_in.write(SAME)
+                    p_in.flush()
+                else:
+                    p_in.write(DIFF + l_block)
+                    p_in.flush()
 
-        if pause_ms:
-            time.sleep(pause_ms)
+            if pause_ms:
+                time.sleep(pause_ms)
 
-        if not interactive:
-            continue
+            if not interactive:
+                continue
 
-        t1 = float(time.time())
-        if (t1 - t_last) >= interval:
-            done_blocks = same_blocks + diff_blocks
-            delta_blocks = done_blocks - last_blocks
-            rate = delta_blocks * blocksize / (1024 * 1024 * (t1 - t_last))
-            print("[worker %d] same: %d, diff: %d, %d/%d, %5.1f MB/s (%s remaining)" % (workerid, same_blocks, diff_blocks, done_blocks, size_blocks, rate, timedelta(seconds = ceil((size_blocks - done_blocks) * (t1 - t0) / done_blocks))), file = options.outfile)
-            last_blocks = done_blocks
-            t_last = t1
+            t1 = float(time.time())
+            if (t1 - t_last) >= interval:
+                done_blocks = same_blocks + diff_blocks
+                delta_blocks = done_blocks - last_blocks
+                rate = delta_blocks * blocksize / (1024 * 1024 * (t1 - t_last))
+                print("[worker %d] same: %d, diff: %d, %d/%d, %5.1f MB/s (%s remaining)" % (workerid, same_blocks, diff_blocks, done_blocks, size_blocks, rate, timedelta(seconds = ceil((size_blocks - done_blocks) * (t1 - t0) / done_blocks))), file = options.outfile)
+                last_blocks = done_blocks
+                t_last = t1
 
-        if (same_blocks + diff_blocks) == size_blocks:
-            break
+            if (same_blocks + diff_blocks) == size_blocks:
+                break
 
     rate = size_blocks * blocksize / (1024.0 * 1024) / (time.time() - t0)
     print("[worker %d] same: %d, diff: %d, %d/%d, %5.1f MB/s" % (workerid, same_blocks, diff_blocks, same_blocks + diff_blocks, size_blocks, rate), file = options.outfile)
@@ -357,14 +499,15 @@ if __name__ == "__main__":
     parser.add_option("-w", "--workers", dest = "workers", type = "int", help = "number of workers to fork (defaults to 1)", default = 1)
     parser.add_option("-l", "--splay", dest = "splay", type = "int", help = "sleep between creating workers (ms, defaults to 0)", default = 250)
     parser.add_option("-b", "--blocksize", dest = "blocksize", type = "int", help = "block size (bytes, defaults to 1MB)", default = 1024 * 1024)
+    parser.add_option("-B", "--batch", dest = "batch", type = "int", help = "batch N blocks per round-trip for pipelining, dramatically reducing latency impact (0 = off, defaults to 64)", default = 64)
     parser.add_option("--splitparts", dest = "splitparts", type = "int", help = "split block into parts (defaults to 1 part)", default = 1)
     parser.add_option("--startpart", dest = "startpart", type = "int", help = "which part to start from (defaults to part 1)", default = 1)
     parser.add_option("-1", "--hash", dest = "hash", help = "hash used for block comparison (defaults to \"sha512\")", default = "sha512")
     parser.add_option("-2", "--additionalhash", dest = "addhash", help = "second hash used for extra comparison (default is none)")
     parser.add_option("-d", "--fadvise", dest = "fadvise", type = "int", help = "lower cache pressure by using posix_fadivse (requires Python 3 or python-fadvise; 0 = off, 1 = local on, 2 = remote on, 3 = both on; defaults to 3)", default = 3)
     parser.add_option("-p", "--pause", dest = "pause", type="int", help = "pause between processing blocks, reduces system load (ms, defaults to 0)", default = 0)
-    parser.add_option("-c", "--cipher", dest = "cipher", help = "cipher specification for SSH (defaults to blowfish)", default = "blowfish")
-    parser.add_option("-C", "--compress", dest = "compress", action = "store_true", help = "enable compression over SSH (defaults to on)", default = True)
+    parser.add_option("-c", "--cipher", dest = "cipher", help = "cipher specification for SSH (defaults to aes128-gcm@openssh.com)", default = "aes128-gcm@openssh.com")
+    parser.add_option("-C", "--compress", dest = "compress", action = "store_true", help = "enable compression over SSH (defaults to off; usually hurts performance with incompressible block data)", default = False)
     parser.add_option("-i", "--id", dest = "keyfile", help = "SSH public key file")
     parser.add_option("-P", "--pass", dest = "passenv", help = "environment variable containing SSH password (requires sshpass)")
     parser.add_option("-s", "--sudo", dest = "sudo", action = "store_true", help = "use sudo on the remote end (defaults to off)", default = False)
@@ -372,7 +515,7 @@ if __name__ == "__main__":
     parser.add_option("-n", "--dryrun", dest = "dryrun", action = "store_true", help = "do a dry run (don't write anything, just report differences)", default = False)
     parser.add_option("-T", "--createdest", dest = "createdest", action = "store_true", help = "create destination file using truncate(2). Should be safe for subsequent syncs as truncate only modifies the file when the size differs", default = False)
     parser.add_option("-S", "--script", dest = "script", help = "location of script on remote host (otherwise current script is sent over)")
-    parser.add_option("-I", "--interpreter", dest = "interpreter", help = "[full path to] interpreter used to invoke remote server (defaults to python2)", default = "python2")
+    parser.add_option("-I", "--interpreter", dest = "interpreter", help = "[full path to] interpreter used to invoke remote server (defaults to python3)", default = "python3")
     parser.add_option("-t", "--interval", dest = "interval", type = "int", help = "interval between stats output (seconds, defaults to 1)", default = 1)
     parser.add_option("-o", "--output", dest = "outfile", help = "send output to file instead of console")
     parser.add_option("-f", "--force", dest = "force", action= "store_true", help = "force sync and DO NOT ask for confirmation if the destination file already exists")
